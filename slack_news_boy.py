@@ -1,0 +1,199 @@
+import logging
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+from apscheduler.schedulers.blocking import BlockingScheduler
+from io import BytesIO
+import time
+from CONSTANT import slack_token, slack_channel_id
+
+logging.basicConfig(level=logging.DEBUG)
+
+# Slack Bot OAuth Token and Channel ID
+SLACK_TOKEN = slack_token # Bot OAuth Token
+SLACK_CHANNEL_ID = slack_channel_id  # Replace with your Slack Channel ID
+
+slack_client = WebClient(token=SLACK_TOKEN)
+
+# Store the last scraped news titles
+last_scraped_titles_news = []
+last_scraped_titles_paper = []
+
+def scrape_news():
+    url = "https://www.aitimes.com/news/articleList.html"
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    articles = []
+    for item in soup.select('section#section-list ul.type1 li'):
+        title_tag = item.select_one('h4.titles a')
+        time_tag = item.select_one('em.info.dated')
+
+        if title_tag and time_tag:
+            title = title_tag.get_text(strip=True)
+            link = "https://www.aitimes.com" + title_tag['href']
+            time = time_tag.get_text(strip=True)
+            # Convert time to datetime object for sorting
+            time_obj = datetime.strptime(time, "%m.%d %H:%M")
+            articles.append({
+                'title': title,
+                'link': link,
+                'time': time,
+                'time_obj': time_obj
+            })
+    # Sort articles by time_obj in ascending order
+    articles.sort(key=lambda x: x['time_obj'])
+
+    return articles
+
+def scrape_papers():
+    url = "https://huggingface.co/papers"
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    papers = []
+
+    # Remove duplicates by using a set for URLs
+    seen_urls = set()
+
+    for item in soup.select('div.relative.grid.grid-cols-1.gap-14.lg\\:grid-cols-2 article'):
+        title_tag = item.select_one('h3 a')
+        img_tag = item.select_one('img')
+        if title_tag and img_tag:
+            title = title_tag.get_text(strip=True)
+            link = "https://huggingface.co" + title_tag['href']
+            img_src = img_tag['src']
+            if link not in seen_urls:
+                seen_urls.add(link)
+                papers.append({
+                    'title': title,
+                    'link': link,
+                    'image': img_src
+                })
+
+    return papers
+
+
+def send_news_to_slack(articles):
+    chunk_size = 20
+    for i in range(0, len(articles), chunk_size):
+        chunk = articles[i:i + chunk_size]
+        blocks = []
+        for article in chunk:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"⏰: {article['time']}\n🗞️: *<{article['link']}|{article['title']}>*\n"
+                }
+            })
+            blocks.append({"type": "divider"})
+
+        try:
+            response = slack_client.chat_postMessage(
+                channel=SLACK_CHANNEL_ID,
+                blocks=blocks,
+                unfurl_links=False,  # 링크 미리보기 비활성화
+                unfurl_media=False   # 미디어 미리보기 비활성화
+            )
+            logging.info(f"Message sent to Slack: {response['ts']}")
+        except SlackApiError as e:
+            logging.error(f"Error sending message to Slack: {e.response['error']}")
+
+            
+def send_papers_to_slack(papers):
+    if not papers:
+        return
+
+    date_str = datetime.now().strftime("%b. %d. %Y")
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"📮 *Daily Papers [{date_str}]* 📮\n"
+            }
+        }
+    ]
+
+    for i, paper in enumerate(papers, 1):
+        paper_block = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*<{paper['link']}|{paper['title']}>*"
+                }
+            },
+            {
+                "type": "image",
+                "image_url": paper['image'],
+                "alt_text": paper['title']
+            }
+            ,
+            {
+                "type": "divider"
+            }
+        ]
+        blocks.extend(paper_block)
+
+    try:
+        response = slack_client.chat_postMessage(
+            channel=SLACK_CHANNEL_ID,
+            blocks=blocks,
+            unfurl_links=False,  # 링크 미리보기 비활성화
+            unfurl_media=False   # 미디어 미리보기 비활성화
+        )
+        logging.info(f"Message sent to Slack: {response['ts']}")
+    except SlackApiError as e:
+        logging.error(f"Error sending message to Slack: {e.response['error']}")
+    except Exception as e:
+        logging.error(f"Error creating or sending message: {str(e)}")
+
+def news_sender():
+    global last_scraped_titles_news
+    new_scraped_news = scrape_news()
+
+    new_articles = [article for article in new_scraped_news if article['title'] not in last_scraped_titles_news]
+
+    if new_articles:
+        logging.info(f"[New!] {len(new_articles)} articles found.")
+        send_news_to_slack(new_articles)
+        last_scraped_titles_news = [article['title'] for article in new_scraped_news]  # 최신 기사 목록 업데이트
+    else:
+        logging.info("Keep waiting for another news ...")
+
+def papers_sender():
+    global last_scraped_titles_paper
+    new_papers = scrape_papers()
+
+    # 새로운 논문 중 이미 보낸 논문을 제외
+    new_articles = [paper for paper in new_papers if paper['title'] not in last_scraped_titles_paper]
+
+    if new_articles:
+        logging.info(f"[New!] {len(new_articles)} papers found.")
+        send_papers_to_slack(new_articles)
+        last_scraped_titles_paper = [paper['title'] for paper in new_papers]  # 최신 논문 목록 업데이트
+    else:
+        logging.info("Keep waiting for another paper ...")
+
+
+# 스케줄러 설정
+scheduler = BlockingScheduler()
+
+# 첫 실행시 바로 실행되도록 설정
+# scheduler.add_job(papers_sender, 'date', run_date=datetime.now())
+# scheduler.add_job(news_sender, 'date', run_date=datetime.now())
+
+scheduler.add_job(papers_sender, 'interval', minutes=1)  # Check every n minutes
+scheduler.add_job(news_sender, 'interval', minutes=1)
+
+
+if __name__ == '__main__':
+    try:
+        logging.info("Starting news and papers sender...")
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Stopping news and papers sender...")
