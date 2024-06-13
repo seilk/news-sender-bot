@@ -54,23 +54,25 @@ def scrape_papers():
     soup = BeautifulSoup(response.content, 'html.parser')
 
     papers = []
-
-    # Remove duplicates by using a set for URLs
     seen_urls = set()
 
-    for item in soup.select('div.relative.grid.grid-cols-1.gap-14.lg\\:grid-cols-2 article'):
+    for item in soup.select('article.relative.flex.flex-col.overflow-hidden.rounded-xl.border'):
         title_tag = item.select_one('h3 a')
-        img_tag = item.select_one('img')
-        if title_tag and img_tag:
+        video_tag = item.select_one('video')  # 비디오 태그 선택
+        img_tag = item.select_one('a img')  # 이미지 태그 선택
+        if title_tag and (img_tag or video_tag):
             title = title_tag.get_text(strip=True)
             link = "https://huggingface.co" + title_tag['href']
-            img_src = img_tag['src']
+            if video_tag:  # 비디오가 있으면 비디오 URL 사용
+                media_src = video_tag['src']
+            else:  # 비디오가 없으면 이미지 URL 사용
+                media_src = img_tag['src']
             if link not in seen_urls:
                 seen_urls.add(link)
                 papers.append({
                     'title': title,
                     'link': link,
-                    'image': img_src
+                    'media': media_src  # 'image' 대신 'media' 사용
                 })
 
     return papers
@@ -102,7 +104,15 @@ def send_news_to_slack(articles):
         except SlackApiError as e:
             logging.error(f"Error sending message to Slack: {e.response['error']}")
 
-            
+
+def is_media_url_valid(url):
+    try:
+        response = requests.head(url)
+        return response.status_code == 200
+    except Exception:
+        return False
+                
+
 def send_papers_to_slack(papers):
     if not papers:
         return
@@ -118,7 +128,26 @@ def send_papers_to_slack(papers):
         }
     ]
 
-    for i, paper in enumerate(papers, 1):
+    for paper in papers:
+        if not is_media_url_valid(paper['media']):
+            logging.warning(f"Invalid media URL: {paper['media']}")
+            continue
+
+        if paper['media'].endswith(('png', 'jpg', 'jpeg')):
+            media_block = {
+                "type": "image",
+                "image_url": paper['media'],
+                "alt_text": paper['title']
+            }
+        else:
+            media_block = {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*<{paper['media']}|[Watch Video]>*"
+                }
+            }
+
         paper_block = [
             {
                 "type": "section",
@@ -127,30 +156,33 @@ def send_papers_to_slack(papers):
                     "text": f"*<{paper['link']}|{paper['title']}>*"
                 }
             },
-            {
-                "type": "image",
-                "image_url": paper['image'],
-                "alt_text": paper['title']
-            }
-            ,
+            media_block,
             {
                 "type": "divider"
             }
         ]
         blocks.extend(paper_block)
 
+    def chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
+
+    block_chunks = list(chunks(blocks, 20))
+
     try:
-        response = slack_client.chat_postMessage(
-            channel=SLACK_CHANNEL_ID,
-            blocks=blocks,
-            unfurl_links=False,  # 링크 미리보기 비활성화
-            unfurl_media=False   # 미디어 미리보기 비활성화
-        )
-        logging.info(f"Message sent to Slack: {response['ts']}")
+        for chunk in block_chunks:
+            response = slack_client.chat_postMessage(
+                channel=SLACK_CHANNEL_ID,
+                blocks=chunk,
+                unfurl_links=False,
+                unfurl_media=False
+            )
+            logging.info(f"Message sent to Slack: {response['ts']}")
     except SlackApiError as e:
         logging.error(f"Error sending message to Slack: {e.response['error']}")
     except Exception as e:
         logging.error(f"Error creating or sending message: {str(e)}")
+
 
 def news_sender():
     global last_scraped_titles_news
@@ -187,8 +219,8 @@ scheduler = BlockingScheduler()
 # scheduler.add_job(papers_sender, 'date', run_date=datetime.now())
 # scheduler.add_job(news_sender, 'date', run_date=datetime.now())
 
-scheduler.add_job(papers_sender, 'interval', minutes=1)  # Check every n minutes
-scheduler.add_job(news_sender, 'interval', minutes=1)
+scheduler.add_job(papers_sender, 'interval', minutes=1/6)  # Check every n minutes
+scheduler.add_job(news_sender, 'interval', minutes=1/6)
 
 
 if __name__ == '__main__':
